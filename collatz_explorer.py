@@ -1,4 +1,6 @@
 import time
+import argparse
+import multiprocessing # Added for parallel processing
 
 def get_collatz_sequence_info(start_n, max_iterations=10000):
     """
@@ -99,18 +101,45 @@ def get_collatz_sequence_info(start_n, max_iterations=10000):
     result["peak_value"] = max_val_in_sequence
     return result
 
+# Helper function for multiprocessing to pass multiple arguments to get_collatz_sequence_info
+# Since pool.map/imap only accept functions with a single argument easily.
+def process_number_wrapper(args_tuple):
+    num, max_iter = args_tuple
+    return get_collatz_sequence_info(num, max_iterations=max_iter)
+
 if __name__ == "__main__":
-    # Configuration
-    start_range = 1
-    # end_range = 100 # Test first 100 numbers
-    end_range = 2000 # Test more numbers
-    max_iter_per_num = 1000 # Max steps for each number, increase for deeper search for long sequences
-    output_file_for_novel_cycles = "novel_collatz_cycles.txt"
+    parser = argparse.ArgumentParser(description="Collatz Conjecture Sequence Analyzer.")
+    parser.add_argument("--start", type=int, default=1, help="Starting number of the range to test (inclusive).")
+    parser.add_argument("--end", type=int, default=2000, help="Ending number of the range to test (inclusive).")
+    parser.add_argument("--maxiter", type=int, default=1000, help="Maximum iterations per number before stopping.")
+    parser.add_argument("--outfile", type=str, default="novel_collatz_cycles.txt", help="Output file for detected novel cycles.")
+    parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of worker processes for parallel execution (default: number of CPU cores).")
+
+    args = parser.parse_args()
+
+    start_range = args.start
+    end_range = args.end
+    max_iter_per_num = args.maxiter
+    output_file_for_novel_cycles = args.outfile
+    num_workers = args.workers
+
+    if start_range > end_range:
+        print("Error: Start range cannot be greater than end range.")
+        exit(1)
+    if start_range < 1:
+        print("Error: Start range must be a positive integer.")
+        exit(1)
+    if num_workers < 1:
+        print("Error: Number of workers must be at least 1.")
+        exit(1)
 
     numbers_to_test = list(range(start_range, end_range + 1))
+    # Prepare arguments for the wrapper function
+    tasks_with_args = [(num, max_iter_per_num) for num in numbers_to_test]
 
     print(f"Starting Collatz sequence analysis for numbers from {start_range} to {end_range}")
     print(f"Max iterations per number: {max_iter_per_num}")
+    print(f"Using {num_workers} worker process(es).")
     print(f"Novel cycles will be saved to: {output_file_for_novel_cycles}\n")
 
     non_trivial_cycles_found_list = [] # Renamed to avoid conflict
@@ -124,54 +153,59 @@ if __name__ == "__main__":
     start_time = time.time()
     numbers_processed = 0
 
-    for num in numbers_to_test:
-        info = get_collatz_sequence_info(num, max_iterations=max_iter_per_num)
-        numbers_processed += 1
+    # Using multiprocessing Pool
+    # The chunksize can be tuned. Small chunksize can provide better load balancing for varied task times.
+    # Larger chunksize reduces overhead of task distribution. 
+    # Default chunksize for imap_unordered is 1, which is fine here.
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        # Using imap_unordered to get results as they complete
+        # Pass the wrapper function and the list of argument tuples
+        for info in pool.imap_unordered(process_number_wrapper, tasks_with_args):
+            numbers_processed += 1
 
-        # Update statistics
-        if info["reached_one"]: # Only consider stopping time if 1 was reached
-            if info["steps"] > longest_stopping_time:
-                longest_stopping_time = info["steps"]
-                num_with_longest_stopping_time = info["start_number"]
-        
-        if info["peak_value"] > highest_peak_value:
-            highest_peak_value = info["peak_value"]
-            num_with_highest_peak_value = info["start_number"]
+            if info["reached_one"]: # Only consider stopping time if 1 was reached
+                if info["steps"] > longest_stopping_time:
+                    longest_stopping_time = info["steps"]
+                    num_with_longest_stopping_time = info["start_number"]
+            
+            if info["peak_value"] > highest_peak_value:
+                highest_peak_value = info["peak_value"]
+                num_with_highest_peak_value = info["start_number"]
 
-        # Reporting for each number (optional, can be verbose)
-        # print(f"--- Number: {info['start_number']} ---")
-        # print(f"  Steps: {info['steps']}, Peak: {info['peak_value']}")
-        # print(f"  Reached 1: {info['reached_one']}")
-        
-        if info['hit_max_iterations'] and not info['reached_one']:
-            # print(f"  Hit max iterations ({max_iter_per_num}) before reaching 1 or a confirmed cycle.")
-            did_not_reach_one_within_limit.append(info['start_number'])
-        
-        if info['cycle_detected'] and not info['is_trivial_cycle']:
-            novel_cycle_data = {"start_number": info['start_number'], "cycle_path": info['detected_cycle_path'], "steps_to_cycle_entry": info['steps'], "peak_before_cycle": info['peak_value'] }
-            non_trivial_cycles_found_list.append(novel_cycle_data)
+            # Reporting for each number (optional, can be verbose)
+            # print(f"--- Number: {info['start_number']} ---")
+            # print(f"  Steps: {info['steps']}, Peak: {info['peak_value']}")
+            # print(f"  Reached 1: {info['reached_one']}")
             
-            print(f"  *** NON-TRIVIAL CYCLE DETECTED! ***")
-            print(f"    Start Number: {novel_cycle_data['start_number']}")
-            print(f"    Cycle Path: {novel_cycle_data['cycle_path']}")
-            print(f"    Steps to Cycle: {novel_cycle_data['steps_to_cycle_entry']}")
-            print(f"    Saving to {output_file_for_novel_cycles}...")
+            if info['hit_max_iterations'] and not info['reached_one']:
+                # print(f"  Hit max iterations ({max_iter_per_num}) before reaching 1 or a confirmed cycle.")
+                did_not_reach_one_within_limit.append(info['start_number'])
             
-            try:
-                with open(output_file_for_novel_cycles, 'a') as f_out:
-                    f_out.write(f"NON-TRIVIAL CYCLE DETECTED:\n")
-                    f_out.write(f"  Start Number: {novel_cycle_data['start_number']}\n")
-                    f_out.write(f"  Cycle Path: {novel_cycle_data['cycle_path']}\n")
-                    f_out.write(f"  Steps to Cycle Entry: {novel_cycle_data['steps_to_cycle_entry']}\n")
-                    f_out.write(f"  Peak Value in Sequence: {novel_cycle_data['peak_before_cycle']}\n")
-                    f_out.write(f"  Full sequence leading to cycle: {info['sequence']}\n") # Potentially very long
-                    f_out.write(f"---\n")
-                print(f"    Successfully saved to {output_file_for_novel_cycles}.")
-            except Exception as e:
-                print(f"    ERROR: Could not write to file {output_file_for_novel_cycles}: {e}")
-        # elif not info['reached_one'] and not info['hit_max_iterations']:
-        #      print(f"  Ended without reaching 1, detecting a cycle, or hitting max_iterations (Unusual).")
-        # print("-" * 20)
+            if info['cycle_detected'] and not info['is_trivial_cycle']:
+                novel_cycle_data = {"start_number": info['start_number'], "cycle_path": info['detected_cycle_path'], "steps_to_cycle_entry": info['steps'], "peak_before_cycle": info['peak_value'] }
+                non_trivial_cycles_found_list.append(novel_cycle_data)
+                
+                print(f"  *** NON-TRIVIAL CYCLE DETECTED! (Processed by main thread) ***")
+                print(f"    Start Number: {novel_cycle_data['start_number']}")
+                print(f"    Cycle Path: {novel_cycle_data['cycle_path']}")
+                print(f"    Steps to Cycle: {novel_cycle_data['steps_to_cycle_entry']}")
+                print(f"    Saving to {output_file_for_novel_cycles}...")
+                
+                try:
+                    with open(output_file_for_novel_cycles, 'a') as f_out:
+                        f_out.write(f"NON-TRIVIAL CYCLE DETECTED:\n")
+                        f_out.write(f"  Start Number: {novel_cycle_data['start_number']}\n")
+                        f_out.write(f"  Cycle Path: {novel_cycle_data['cycle_path']}\n")
+                        f_out.write(f"  Steps to Cycle Entry: {novel_cycle_data['steps_to_cycle_entry']}\n")
+                        f_out.write(f"  Peak Value in Sequence: {novel_cycle_data['peak_before_cycle']}\n")
+                        f_out.write(f"  Full sequence leading to cycle: {info['sequence']}\n") # Potentially very long
+                        f_out.write(f"---\n")
+                    print(f"    Successfully saved to {output_file_for_novel_cycles}.")
+                except Exception as e:
+                    print(f"    ERROR: Could not write to file {output_file_for_novel_cycles}: {e}")
+            # elif not info['reached_one'] and not info['hit_max_iterations']:
+            #      print(f"  Ended without reaching 1, detecting a cycle, or hitting max_iterations (Unusual).")
+            # print("-" * 20)
 
     end_time = time.time()
     duration = end_time - start_time
@@ -182,7 +216,7 @@ if __name__ == "__main__":
     print(f"Processing rate: {processing_rate:.2f} numbers/sec.")
     
     if num_with_longest_stopping_time:
-        print(f"Number with longest stopping time: {num_with_longest_stopping_time} ({longest_stopping_time} steps).")
+        print(f"Number with longest stopping time (to reach 1): {num_with_longest_stopping_time} ({longest_stopping_time} steps).")
     else:
         print("No numbers reached 1 within the iteration limit (or all hit max iterations).")
         
@@ -197,6 +231,8 @@ if __name__ == "__main__":
         print("\nNo non-trivial cycles found in the tested range during this run.")
 
     if did_not_reach_one_within_limit:
+        # Sort this list for more consistent output if needed, especially when using multiple workers
+        did_not_reach_one_within_limit.sort()
         print(f"Numbers that did not reach 1 (or a confirmed cycle) within {max_iter_per_num} iterations: {len(did_not_reach_one_within_limit)}")
         if len(did_not_reach_one_within_limit) < 20: # Print specifics if the list is not too long
              print(f"  List: {did_not_reach_one_within_limit}")
