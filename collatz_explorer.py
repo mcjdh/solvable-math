@@ -1,31 +1,59 @@
 import time
 import argparse
 import multiprocessing # Added for parallel processing
+import signal
+import sys
+import logging
+
+# Global shutdown event for coordinating graceful termination
+shutdown_event = multiprocessing.Event()
+
+# Setup basic logging
+logger = logging.getLogger("CollatzExplorer")
+# Prevent multiprocessing from trying to reconfigure root logger on Windows if script is frozen
+if not getattr(sys, 'frozen', False) and not sys.stdout.isatty() :
+    # Heuristic: if not frozen and stdout is not a TTY, likely being piped or run by a service.
+    # This can sometimes cause issues with multiprocessing's attempts to re-initialize logging.
+    # In such cases, rely on the parent process's logging setup.
+    pass
+else:
+    # Default handler for console - level will be set based on args
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.INFO) # Default logger level, can be overridden by args
+
+# --- Global variable to store the file path for numbers not reaching 1 ---
+# This allows the process_number_wrapper to access it without passing it through every call if set.
+# This is a slight simplification for multiprocessing; a more complex setup might use a dedicated queue for this.
+_failed_log_path = None
+
+
+def signal_handler(sig, frame):
+    # Use print for critical signal path, as logger might be in a weird state during shutdown
+    print(f'Signal {sig} received, initiating graceful shutdown...', flush=True)
+    logger.warning(f"Signal {sig} received, initiating graceful shutdown.")
+    shutdown_event.set()
 
 def get_collatz_sequence_info(start_n, max_iterations=10000):
     """
-    Calculates the Collatz sequence for a starting number,
+    Calculates the Collatz sequence for a starting number using the (3n+1)/2 shortcut,
     determines its stopping time, peak value, and detects cycles.
 
     Args:
         start_n (int): The positive integer to start the sequence from.
-        max_iterations (int): The maximum number of steps to perform
-                              to prevent potential infinite loops.
+        max_iterations (int): The maximum number of steps to perform.
 
     Returns:
-        dict: A dictionary containing information about the sequence:
-            - "start_number": The initial number.
-            - "sequence": The list of numbers in the sequence.
-            - "steps": The number of steps taken.
-            - "peak_value": The highest number encountered in the sequence.
-            - "reached_one": Boolean, true if 1 was reached.
-            - "hit_max_iterations": Boolean, true if max_iterations was reached.
-            - "cycle_detected": Boolean, true if any cycle was detected.
-            - "is_trivial_cycle": Boolean, true if 1 was reached or the cycle is (4, 2, 1).
-            - "detected_cycle_path": The list of numbers forming the detected cycle.
-                                     (Standard [4,2,1] if 1 reached, actual cycle otherwise)
+        dict: Information about the sequence:
+            - "start_number", "sequence", "steps", "peak_value", 
+            - "reached_one", "hit_max_iterations", "cycle_detected",
+            - "is_trivial_cycle": True if 1 reached or cycle is the (1,2) trivial cycle.
+            - "detected_cycle_path": Standard [1,2] if trivial, actual cycle otherwise.
     """
     if not isinstance(start_n, int) or start_n < 1:
+        # This should ideally not happen if input validation is done before calling.
+        logger.error(f"Invalid start_n received in get_collatz_sequence_info: {start_n}")
         raise ValueError("Starting number must be a positive integer.")
 
     current_n = start_n
@@ -33,6 +61,11 @@ def get_collatz_sequence_info(start_n, max_iterations=10000):
     steps = 0
     seen_in_this_path = {current_n: 0} # Store number and its index in sequence_list
     max_val_in_sequence = start_n
+
+    # Trivial cycle with the (3n+1)/2 shortcut is (1, 2)
+    TRIVIAL_CYCLE_REPRESENTATION = [1, 2] 
+    # Permutations for checking, e.g. if cycle is detected as [2,1]
+    SORTED_TRIVIAL_CYCLE = sorted(TRIVIAL_CYCLE_REPRESENTATION)
 
     result = {
         "start_number": start_n,
@@ -49,16 +82,17 @@ def get_collatz_sequence_info(start_n, max_iterations=10000):
     for i in range(max_iterations):
         if current_n == 1:
             result["reached_one"] = True
-            result["cycle_detected"] = True # Reaching 1 means entering the 4-2-1 cycle
+            result["cycle_detected"] = True 
             result["is_trivial_cycle"] = True
-            result["detected_cycle_path"] = [4, 2, 1] # Standard representation
+            result["detected_cycle_path"] = TRIVIAL_CYCLE_REPRESENTATION
             break 
 
-        # Apply Collatz rule
+        # Apply Optimized Collatz rule
         if current_n % 2 == 0:
             current_n = current_n // 2
         else:
-            current_n = 3 * current_n + 1
+            # (3n+1)/2 shortcut for odd numbers
+            current_n = (3 * current_n + 1) // 2
         
         steps += 1
         sequence_list.append(current_n)
@@ -67,28 +101,20 @@ def get_collatz_sequence_info(start_n, max_iterations=10000):
         if current_n in seen_in_this_path:
             result["cycle_detected"] = True
             cycle_start_index = seen_in_this_path[current_n]
-            # Capture the cycle elements, not including the final repeated element that closes it
             detected_cycle = sequence_list[cycle_start_index:-1]
             result["detected_cycle_path"] = detected_cycle
             
             is_trivial = False
-            # Check if the cycle contains 1 or is a permutation of [1,2,4]
-            if 1 in detected_cycle:
-                is_trivial = True
-                result["detected_cycle_path"] = [4, 2, 1] # Standardize
-            else:
-                # Check for permutations like [2,4,1], [4,1,2] etc. for the [1,2,4] set
-                # A simple way is to check if the sorted version of the detected cycle is [1,2,4]
-                # This handles short cycles. For very long cycles, this direct comparison might be too simple
-                # if we were looking for sub-cycles not containing 1, but the primary Collatz disproof is a non-1 cycle.
-                if sorted(detected_cycle) == [1,2,4]:
-                     is_trivial = True
-                     result["detected_cycle_path"] = [4, 2, 1] # Standardize
+            if 1 in detected_cycle or 2 in detected_cycle: # If 1 or 2 is in the cycle, it must be the trivial one
+                if sorted(detected_cycle) == SORTED_TRIVIAL_CYCLE:
+                    is_trivial = True
+                    result["detected_cycle_path"] = TRIVIAL_CYCLE_REPRESENTATION
             
             result["is_trivial_cycle"] = is_trivial
             if current_n == 1: # Cycle explicitly ended by reaching 1
                 result["reached_one"] = True
-                result["is_trivial_cycle"] = True # Ensure this is set
+                result["is_trivial_cycle"] = True # Ensure this is set and path is standard
+                result["detected_cycle_path"] = TRIVIAL_CYCLE_REPRESENTATION
 
             break 
         
@@ -104,46 +130,120 @@ def get_collatz_sequence_info(start_n, max_iterations=10000):
 # Helper function for multiprocessing to pass multiple arguments to get_collatz_sequence_info
 # Since pool.map/imap only accept functions with a single argument easily.
 def process_number_wrapper(args_tuple):
+    # Check for shutdown before starting potentially long computation
+    if shutdown_event.is_set():
+        return None # Or some indicator that task was skipped due to shutdown
+    
     num, max_iter = args_tuple
-    return get_collatz_sequence_info(num, max_iterations=max_iter)
+    result = get_collatz_sequence_info(num, max_iterations=max_iter)
+
+    # Handle logging for numbers not reaching 1 to a dedicated file, if configured
+    # This check is done in the worker process.
+    if _failed_log_path and result['hit_max_iterations'] and not result['reached_one']:
+        try:
+            with open(_failed_log_path, 'a') as f_failed:
+                f_failed.write(f"{result['start_number']}\n")
+        except IOError as e:
+            logger.error(f"Worker failed to write to failed_log {_failed_log_path} for N={result['start_number']}: {e}")
+            # Optionally, could return a special marker or re-raise to signal this,
+            # but for now, just log it from worker. Main process won't add it to its in-memory list.
+    return result
+
+# Task generator for indefinite run
+def task_generator_func(initial_n, max_iterations_per_task, event):
+    n = initial_n
+    while not event.is_set():
+        yield (n, max_iterations_per_task)
+        n += 1
+    logger.info(f"Task generator received shutdown signal. Stopped yielding new tasks. Last n offered: {n-1}")
+
+# Function to initialize the global failed_log_path for worker processes
+def initialize_worker(failed_log_file_path):
+    global _failed_log_path
+    _failed_log_path = failed_log_file_path
+    # Also, re-register signal handler for workers if they are expected to catch signals independently
+    # For SIGINT, usually only main process gets it. For SIGTERM, it depends.
+    # For now, workers rely on shutdown_event which is multiprocessing-safe.
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Collatz Conjecture Sequence Analyzer.")
-    parser.add_argument("--start", type=int, default=1, help="Starting number of the range to test (inclusive).")
-    parser.add_argument("--end", type=int, default=2000, help="Ending number of the range to test (inclusive).")
-    parser.add_argument("--maxiter", type=int, default=1000, help="Maximum iterations per number before stopping.")
-    parser.add_argument("--outfile", type=str, default="novel_collatz_cycles.txt", help="Output file for detected novel cycles.")
-    parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of worker processes for parallel execution (default: number of CPU cores).")
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    parser = argparse.ArgumentParser(
+        description="Collatz Conjecture Sequence Analyzer using (3n+1)/2 shortcut. Runs indefinitely until interrupted (Ctrl+C).",
+        formatter_class=argparse.RawTextHelpFormatter # Allows for newlines in help text
+    )
+    parser.add_argument("--start", type=int, default=1, 
+                        help="Starting number for the analysis. To explore different number ranges upon restarting the script, "
+                             "provide a different starting number. Default: 1.")
+    # Removed --end argument for indefinite run
+    parser.add_argument("--maxiter", type=int, default=2000, help="Maximum iterations per number (using (3n+1)/2 shortcut). Default: 2000.")
+    parser.add_argument("--outfile", type=str, default="novel_collatz_cycles.txt", help="Output file for detected novel cycles. Default: novel_collatz_cycles.txt.")
+    parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(), help="Number of worker processes (default: number of CPU cores).")
+    parser.add_argument("--verbose", action="store_true", help="Print details for each number processed (can be very noisy).")
+    parser.add_argument("--progress-interval", type=int, default=10000, help="Print a progress update every N numbers processed. Default: 10000. Set to 0 to disable.")
+    parser.add_argument("--log-file", type=str, default=None, help="Path to a file for saving all log messages (DEBUG level and above).")
+    parser.add_argument("--failed-log", type=str, default=None, help="Path to a file for logging numbers that hit max_iterations without reaching 1. If not set, these are kept in memory (and may be truncated in summary).")
 
     args = parser.parse_args()
 
-    start_range = args.start
-    end_range = args.end
+    # Configure logging based on arguments
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file, mode='a') # Append mode
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(processName)s - %(levelname)s - %(message)s'))
+        file_handler.setLevel(logging.DEBUG) # Log everything to file
+        logger.addHandler(file_handler)
+        # If logging to file, we might want console to be less verbose unless --verbose is also set
+        if not args.verbose:
+            logger.setLevel(logging.INFO) # Default for logger if file is used, console is INFO
+            console_handler.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.DEBUG) # Overall logger level
+            console_handler.setLevel(logging.DEBUG) # Console also DEBUG
+    elif args.verbose: # No log file, but verbose is set
+        logger.setLevel(logging.DEBUG)
+        console_handler.setLevel(logging.DEBUG)
+    else: # No log file, not verbose
+        logger.setLevel(logging.INFO)
+        console_handler.setLevel(logging.INFO)
+
+    start_num_for_run = args.start # Renamed from start_range
     max_iter_per_num = args.maxiter
     output_file_for_novel_cycles = args.outfile
     num_workers = args.workers
+    verbose_output = args.verbose
+    progress_update_interval = args.progress_interval
+    
+    # Set the global for worker processes if --failed-log is used
+    if args.failed_log:
+        _failed_log_path = args.failed_log
+        logger.info(f"Numbers hitting max_iterations will be logged to: {_failed_log_path}")
+        # Clear the file at the start of the run if it exists? Or append? For now, append.
+        # Consider adding a check or an option for this.
 
-    if start_range > end_range:
-        print("Error: Start range cannot be greater than end range.")
-        exit(1)
-    if start_range < 1:
-        print("Error: Start range must be a positive integer.")
+    if start_num_for_run < 1:
+        logger.error("Error: Start number must be a positive integer.")
         exit(1)
     if num_workers < 1:
-        print("Error: Number of workers must be at least 1.")
+        logger.error("Error: Number of workers must be at least 1.")
         exit(1)
 
-    numbers_to_test = list(range(start_range, end_range + 1))
-    # Prepare arguments for the wrapper function
-    tasks_with_args = [(num, max_iter_per_num) for num in numbers_to_test]
+    # Removed numbers_to_test list and tasks_with_args pre-population
 
-    print(f"Starting Collatz sequence analysis for numbers from {start_range} to {end_range}")
-    print(f"Max iterations per number: {max_iter_per_num}")
-    print(f"Using {num_workers} worker process(es).")
-    print(f"Novel cycles will be saved to: {output_file_for_novel_cycles}\n")
+    logger.info(f"Starting Collatz sequence analysis (using (3n+1)/2 shortcut) from number {start_num_for_run} indefinitely.")
+    logger.info(f"Script will run until manually interrupted (Ctrl+C).")
+    logger.info(f"Max iterations per number: {max_iter_per_num}")
+    logger.info(f"Using {num_workers} worker process(es).")
+    if progress_update_interval > 0:
+        logger.info(f"Progress updates will be printed every {progress_update_interval} numbers.")
+    logger.info(f"Novel cycles will be saved to: {output_file_for_novel_cycles}")
+    if args.log_file:
+        logger.info(f"Detailed logs will be saved to: {args.log_file}")
 
-    non_trivial_cycles_found_list = [] # Renamed to avoid conflict
-    did_not_reach_one_within_limit = []
+    non_trivial_cycles_found_list = []
+    # This list is now only used if _failed_log_path is None
+    did_not_reach_one_within_limit_memory = [] 
+    count_did_not_reach_one = 0 # Always count, regardless of logging to file or memory
     
     longest_stopping_time = 0
     num_with_longest_stopping_time = 0
@@ -152,104 +252,159 @@ if __name__ == "__main__":
     
     start_time = time.time()
     numbers_processed = 0
+    last_progress_print_time = start_time
 
     # Using multiprocessing Pool
-    # The chunksize can be tuned. Small chunksize can provide better load balancing for varied task times.
-    # Larger chunksize reduces overhead of task distribution. 
-    # Default chunksize for imap_unordered is 1, which is fine here.
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        # Using imap_unordered to get results as they complete
-        # Pass the wrapper function and the list of argument tuples
-        for info in pool.imap_unordered(process_number_wrapper, tasks_with_args):
-            numbers_processed += 1
+    try:
+        # Pass the _failed_log_path to the worker initializer
+        pool_initializer = initialize_worker if args.failed_log else None
+        pool_initargs = (args.failed_log,) if args.failed_log else ()
 
-            if info["reached_one"]: # Only consider stopping time if 1 was reached
-                if info["steps"] > longest_stopping_time:
-                    longest_stopping_time = info["steps"]
-                    num_with_longest_stopping_time = info["start_number"]
+        with multiprocessing.Pool(processes=num_workers, initializer=pool_initializer, initargs=pool_initargs) as pool:
+            task_iterable = task_generator_func(start_num_for_run, max_iter_per_num, shutdown_event)
             
-            if info["peak_value"] > highest_peak_value:
-                highest_peak_value = info["peak_value"]
-                num_with_highest_peak_value = info["start_number"]
+            current_highest_processed_n = start_num_for_run -1
 
-            # Reporting for each number (optional, can be verbose)
-            # print(f"--- Number: {info['start_number']} ---")
-            # print(f"  Steps: {info['steps']}, Peak: {info['peak_value']}")
-            # print(f"  Reached 1: {info['reached_one']}")
+            for info in pool.imap_unordered(process_number_wrapper, task_iterable):
+                if shutdown_event.is_set() and info is None: 
+                    # This handles case where task_generator stops and pool might still process a few Nones
+                    # if process_number_wrapper returns None due to shutdown_event before actual processing
+                    logger.debug("Received None from worker, likely due to shutdown, skipping.")
+                    continue
+                if info is None: # Should not happen if shutdown_event check above is robust
+                    logger.warning("Received unexpected None from worker. Skipping.")
+                    continue
+
+                numbers_processed += 1
+                current_highest_processed_n = max(current_highest_processed_n, info['start_number'])
+
+                logger.debug(f"Num: {info['start_number']:<8} Steps: {info['steps']:<5} Peak: {info['peak_value']:<10} Reached_1: {info['reached_one']} Hit_Max: {info['hit_max_iterations']}")
+
+                if info["reached_one"]: 
+                    if info["steps"] > longest_stopping_time:
+                        longest_stopping_time = info["steps"]
+                        num_with_longest_stopping_time = info["start_number"]
             
-            if info['hit_max_iterations'] and not info['reached_one']:
-                # print(f"  Hit max iterations ({max_iter_per_num}) before reaching 1 or a confirmed cycle.")
-                did_not_reach_one_within_limit.append(info['start_number'])
+                if info["peak_value"] > highest_peak_value:
+                    highest_peak_value = info["peak_value"]
+                    num_with_highest_peak_value = info["start_number"]
+
+                if info['hit_max_iterations'] and not info['reached_one']:
+                    count_did_not_reach_one += 1
+                    if not _failed_log_path: # Only append to memory list if not logging to file
+                        did_not_reach_one_within_limit_memory.append(info['start_number'])
             
-            if info['cycle_detected'] and not info['is_trivial_cycle']:
-                novel_cycle_data = {"start_number": info['start_number'], "cycle_path": info['detected_cycle_path'], "steps_to_cycle_entry": info['steps'], "peak_before_cycle": info['peak_value'] }
-                non_trivial_cycles_found_list.append(novel_cycle_data)
+                if info['cycle_detected'] and not info['is_trivial_cycle']:
+                    novel_cycle_data = {
+                        "start_number": info['start_number'], 
+                        "cycle_path": info['detected_cycle_path'], 
+                        "steps_to_cycle_entry": info['steps'], 
+                        "peak_before_cycle": info['peak_value'] 
+                    }
+                    non_trivial_cycles_found_list.append(novel_cycle_data)
                 
-                print(f"  *** NON-TRIVIAL CYCLE DETECTED! (Processed by main thread) ***")
-                print(f"    Start Number: {novel_cycle_data['start_number']}")
-                print(f"    Cycle Path: {novel_cycle_data['cycle_path']}")
-                print(f"    Steps to Cycle: {novel_cycle_data['steps_to_cycle_entry']}")
-                print(f"    Saving to {output_file_for_novel_cycles}...")
+                    # Log as warning and also print to stdout for emphasis
+                    cycle_msg = (f"NON-TRIVIAL CYCLE DETECTED! Start: {novel_cycle_data['start_number']}, "
+                                 f"Path: {novel_cycle_data['cycle_path']}, Steps: {novel_cycle_data['steps_to_cycle_entry']}")
+                    logger.warning(cycle_msg)
+                    print(f"\n  *** {cycle_msg} ***") # Direct print for immediate visibility
+                    print(f"    Saving to {output_file_for_novel_cycles}...", flush=True)
+                    logger.info(f"Saving non-trivial cycle for start N={novel_cycle_data['start_number']} to {output_file_for_novel_cycles}")
                 
-                try:
-                    with open(output_file_for_novel_cycles, 'a') as f_out:
-                        f_out.write(f"NON-TRIVIAL CYCLE DETECTED:\n")
-                        f_out.write(f"  Start Number: {novel_cycle_data['start_number']}\n")
-                        f_out.write(f"  Cycle Path: {novel_cycle_data['cycle_path']}\n")
-                        f_out.write(f"  Steps to Cycle Entry: {novel_cycle_data['steps_to_cycle_entry']}\n")
-                        f_out.write(f"  Peak Value in Sequence: {novel_cycle_data['peak_before_cycle']}\n")
-                        f_out.write(f"  Full sequence leading to cycle: {info['sequence']}\n") # Potentially very long
-                        f_out.write(f"---\n")
-                    print(f"    Successfully saved to {output_file_for_novel_cycles}.")
-                except Exception as e:
-                    print(f"    ERROR: Could not write to file {output_file_for_novel_cycles}: {e}")
-            # elif not info['reached_one'] and not info['hit_max_iterations']:
-            #      print(f"  Ended without reaching 1, detecting a cycle, or hitting max_iterations (Unusual).")
-            # print("-" * 20)
+                    try:
+                        with open(output_file_for_novel_cycles, 'a') as f_out:
+                            f_out.write(f"NON-TRIVIAL CYCLE DETECTED ((3n+1)/2 shortcut version):\n")
+                            f_out.write(f"  Start Number: {novel_cycle_data['start_number']}\n")
+                            f_out.write(f"  Cycle Path: {novel_cycle_data['cycle_path']}\n")
+                            f_out.write(f"  Steps to Cycle Entry: {novel_cycle_data['steps_to_cycle_entry']}\n")
+                            f_out.write(f"  Peak Value in Sequence: {novel_cycle_data['peak_before_cycle']}\n")
+                            f_out.write(f"  Full sequence leading to cycle: {info['sequence']}\n") 
+                            f_out.write(f"---\n")
+                    except IOError as e:
+                        logger.error(f"Error writing novel cycle to file {output_file_for_novel_cycles}: {e}")
+                        print(f"Error writing novel cycle to file: {e}", flush=True)
+                
+                # Progress Reporting
+                if progress_update_interval > 0 and numbers_processed % progress_update_interval == 0:
+                    current_run_time = time.time() - start_time
+                    nums_per_sec = numbers_processed / current_run_time if current_run_time > 0 else 0
+                    logger.info("--- Progress ---")
+                    logger.info(f"  Numbers Processed: {numbers_processed}")
+                    logger.info(f"  Current Highest N: {current_highest_processed_n}")
+                    logger.info(f"  Elapsed Time: {current_run_time:.2f}s")
+                    logger.info(f"  Rate: {nums_per_sec:.2f} num/s")
+                    logger.info(f"  Longest Stop: {num_with_longest_stopping_time} (Steps: {longest_stopping_time})")
+                    logger.info(f"  Highest Peak: {num_with_highest_peak_value} (Peak: {highest_peak_value})")
+                    logger.info(f"  Novel Cycles Found: {len(non_trivial_cycles_found_list)}")
+                    logger.info(f"  Hit Max Iterations: {count_did_not_reach_one}")
 
-    end_time = time.time()
-    duration = end_time - start_time
-    processing_rate = numbers_processed / duration if duration > 0 else float('inf')
+                if shutdown_event.is_set():
+                    logger.info("Shutdown initiated by event, processing remaining tasks from pool...")
+                    # Loop will break naturally when imap_unordered is exhausted after generator stops.
+
+            if shutdown_event.is_set(): # After loop completes, if shutdown was triggered
+                logger.info("All tasks processed after shutdown signal.")
+
+    except KeyboardInterrupt: 
+        # This is a fallback; signal handler should catch it first.
+        # print is okay here as it's an emergency exit.
+        print("\nKeyboardInterrupt caught directly in main. Forcing shutdown...", flush=True)
+        logger.critical("KeyboardInterrupt caught directly in main. Forcing shutdown...")
+        shutdown_event.set()
     
-    print("\n--- Overall Summary ---")
-    print(f"Processed {numbers_processed} numbers (from {start_range} to {end_range}) in {duration:.2f} seconds.")
-    print(f"Processing rate: {processing_rate:.2f} numbers/sec.")
-    
-    if num_with_longest_stopping_time:
-        print(f"Number with longest stopping time (to reach 1): {num_with_longest_stopping_time} ({longest_stopping_time} steps).")
-    else:
-        print("No numbers reached 1 within the iteration limit (or all hit max iterations).")
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred in the main processing loop: {e}", exc_info=True)
+        # print is okay here for visibility if logger isn't working.
+        print(f"\nAn unexpected error occurred: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        shutdown_event.set() 
+
+    finally:
+        end_time = time.time()
+        total_time = end_time - start_time
         
-    if num_with_highest_peak_value:
-        print(f"Number that reached highest peak value: {num_with_highest_peak_value} (peak: {highest_peak_value}).")
+        summary_type = "Interrupted Summary" if shutdown_event.is_set() else "Final Summary"
+        
+        logger.info(f"\n--- {summary_type} ({numbers_processed} numbers processed) ---")
+        logger.info(f"Total processing time: {total_time:.2f} seconds.")
+        if numbers_processed > 0 and total_time > 0:
+            avg_time_num = total_time / numbers_processed
+            avg_rate_num = numbers_processed / total_time
+            logger.info(f"Average time per number: {avg_time_num:.6f} seconds.")
+            logger.info(f"Average rate: {avg_rate_num:.2f} numbers/second.")
+        
+        last_n_val = current_highest_processed_n if 'current_highest_processed_n' in locals() else 'N/A'
+        logger.info(f"Last number processed or attempted: {last_n_val}")
+        logger.info(f"Number with longest stopping time (reached 1): {num_with_longest_stopping_time} (Steps: {longest_stopping_time}) (Using (3n+1)/2 shortcut)")
+        logger.info(f"Number with highest peak value: {num_with_highest_peak_value} (Peak: {highest_peak_value})")
 
-    if non_trivial_cycles_found_list:
-        print(f"\nFound {len(non_trivial_cycles_found_list)} non-trivial cycle(s) during this run:")
-        for item in non_trivial_cycles_found_list:
-            print(f"  Start Number: {item['start_number']}, Cycle Path: {item['cycle_path']}")
-    else:
-        print("\nNo non-trivial cycles found in the tested range during this run.")
+        logger.info(f"Total numbers that hit max_iterations ({max_iter_per_num}) without reaching 1: {count_did_not_reach_one}")
+        if _failed_log_path:
+            logger.info(f"  These numbers were logged to: {_failed_log_path}")
+        elif count_did_not_reach_one > 0 : # Only print from memory if not using failed_log and list is not empty
+            if count_did_not_reach_one <= 20:
+                 logger.info(f"  List: {did_not_reach_one_within_limit_memory}")
+            else:
+                 logger.info(f"  (In-memory list truncated. First 20: {did_not_reach_one_within_limit_memory[:20]})")
+        elif count_did_not_reach_one == 0 :
+             logger.info("All processed numbers reached 1 within the iteration limit or were part of a detected cycle.")
 
-    if did_not_reach_one_within_limit:
-        # Sort this list for more consistent output if needed, especially when using multiple workers
-        did_not_reach_one_within_limit.sort()
-        print(f"Numbers that did not reach 1 (or a confirmed cycle) within {max_iter_per_num} iterations: {len(did_not_reach_one_within_limit)}")
-        if len(did_not_reach_one_within_limit) < 20: # Print specifics if the list is not too long
-             print(f"  List: {did_not_reach_one_within_limit}")
-    else:
-        print(f"All tested numbers reached 1 or a trivial cycle within {max_iter_per_num} iterations.")
-
-    # Example of testing a number known for long sequence (e.g., 27, or a higher one like 97 for max_iter=1000)
-    # For max_iter_per_num = 1000, 703 takes 261 steps. 97 takes 118 steps. 27 takes 111.
-    test_specific_num = 27
-    if test_specific_num <= end_range: # only if it was part of the scan or relevant range
-        print(f"\n--- Re-checking a specific long sequence ({test_specific_num}) with {max_iter_per_num} iterations ---")
-        info_specific = get_collatz_sequence_info(test_specific_num, max_iterations=max_iter_per_num)
-        print(f"Number: {info_specific['start_number']}")
-        print(f"Steps: {info_specific['steps']}, Peak: {info_specific['peak_value']}")
-        print(f"Reached 1: {info_specific['reached_one']}")
-        # print(f"Sequence (first 10 and last 10): {info_specific['sequence'][:10]} ... {info_specific['sequence'][-10:]}")
-        print(f"Hit max_iterations: {info_specific['hit_max_iterations']}")
-        if info_specific['cycle_detected']:
-            print(f"Cycle Detected: {info_specific['detected_cycle_path']}")
-            print(f"Is Trivial Cycle: {info_specific['is_trivial_cycle']}") 
+        if non_trivial_cycles_found_list:
+            logger.warning(f"Non-trivial cycles detected: {len(non_trivial_cycles_found_list)}")
+            for cycle_info in non_trivial_cycles_found_list:
+                logger.warning(f"  - Start: {cycle_info['start_number']}, Cycle: {cycle_info['cycle_path']}, Steps to entry: {cycle_info['steps_to_cycle_entry']}")
+        else:
+            logger.info("No non-trivial cycles detected during this run.")
+        
+        logger.info(f"Novel cycles (if any) saved to: {output_file_for_novel_cycles}")
+        logger.info("Exiting.")
+        
+        # Ensure all handlers are flushed, especially file handlers
+        for handler in logger.handlers:
+            handler.flush()
+            handler.close()
+            logger.removeHandler(handler) # Optional: clean up handlers
+        
+        # Final print to physical stdout for very basic confirmation if logging is broken
+        print("Script finished or interrupted. Check logs for details.", flush=True) 
